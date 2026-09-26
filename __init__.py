@@ -283,6 +283,12 @@ _queue_worker_started = False
 _item_counter = 0
 _counter_lock = asyncio.Lock()
 
+# prompt_ids owned by Modal cloud. They stay visible in the local
+# prompt_queue (so the native queue panel, /queue and remaining-counts
+# work), but _install_modal_queue_guard() stops the LOCAL worker thread
+# from consuming them — otherwise every cloud prompt also runs locally.
+_MODAL_PROMPT_IDS: set = set()
+
 
 def _send(sid: str, event: str, data: dict):
     if _server:
@@ -293,7 +299,57 @@ def _pq():
     return _server.prompt_queue if _server else None
 
 
-def _register_running(item: tuple) -> int:
+def _install_modal_queue_guard():
+    """Keep Modal-cloud items visible but out of the LOCAL worker's reach.
+
+    Wraps PromptQueue.get (consumed only by main.py's prompt_worker thread)
+    so it skips prompt_ids owned by Modal and only pops local ones.
+    Our own worker claims Modal items via _register_running instead.
+    Safe to call multiple times; no-op when the server is unavailable
+    (e.g. unit tests).
+    """
+    pq = _pq()
+    if pq is None or getattr(pq, "_comfymodal_guard_installed", False):
+        return
+    import heapq
+
+    def guarded_get(timeout=None):
+        import time as _time
+        deadline = None if timeout is None else _time.monotonic() + timeout
+        with pq.not_empty:
+            while True:
+                best = -1
+                for i, x in enumerate(pq.queue):
+                    if x[1] not in _MODAL_PROMPT_IDS:
+                        if best == -1 or x[0] < pq.queue[best][0]:
+                            best = i
+                if best != -1:
+                    item = pq.queue.pop(best)
+                    heapq.heapify(pq.queue)
+                    key = pq.task_counter
+                    pq.currently_running[key] = copy.deepcopy(item)
+                    pq.task_counter += 1
+                    pq.server.queue_updated()
+                    return (item, key)
+                # Only Modal-owned (or no) items queued: wait, don't consume.
+                if deadline is not None:
+                    remaining = deadline - _time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    pq.not_empty.wait(timeout=remaining)
+                else:
+                    pq.not_empty.wait()
+
+    pq.get = guarded_get
+    pq._comfymodal_guard_installed = True
+
+
+def _register_running(item: tuple):
+    """Claim a Modal item from pending into currently_running.
+
+    Returns the queue key, or None if the item was already removed
+    (user deleted/cleared the queue) — the caller must skip execution then.
+    """
     pq = _pq()
     if pq is None:
         return 0
@@ -303,7 +359,7 @@ def _register_running(item: tuple) -> int:
             pq.queue.remove(item)
             heapq.heapify(pq.queue)
         except ValueError:
-            pass
+            return None
         key = pq.task_counter
         pq.currently_running[key] = copy.deepcopy(item)
         pq.task_counter += 1
@@ -312,6 +368,7 @@ def _register_running(item: tuple) -> int:
 
 
 def _finish_job(item_id: int, prompt_id: str, outputs: dict, success: bool):
+    _MODAL_PROMPT_IDS.discard(prompt_id)
     pq = _pq()
     if pq is None:
         return
@@ -339,6 +396,13 @@ async def _execute_job(item: tuple, item_id: int):
     sid = extra_data.get("client_id", "")
 
     task_key = _register_running(item)
+    if task_key is None:
+        # Item was deleted/cleared from the queue before we claimed it.
+        print(f"[comfyui-modal] Prompt {prompt_id} removed from queue before start — skipping remote run.")
+        _send(sid, "executing", {"node": None, "display_node": None, "prompt_id": prompt_id})
+        _send(sid, "execution_interrupted", {"prompt_id": prompt_id})
+        _MODAL_PROMPT_IDS.discard(prompt_id)
+        return
 
     node_ids = list(workflow.keys())
     _send(sid, "execution_start", {"prompt_id": prompt_id})
@@ -422,6 +486,8 @@ async def _execute_job(item: tuple, item_id: int):
 
 
 if _server:
+    _install_modal_queue_guard()
+
     @_server.routes.get("/comfymodal/auth/status")
     async def modal_auth_status(request: web.Request) -> web.Response:
         return web.json_response({"connected": _is_modal_token_set()})
@@ -473,15 +539,13 @@ if _server:
             extra_data = {"client_id": client_id, "create_time": int(time.time() * 1000)}
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
 
-        # NOTE: Do NOT push this item into the local ComfyUI prompt queue
-        # (pq.queue). The local execution loop consumes pq.queue, so pushing
-        # here runs the SAME workflow locally in addition to Modal cloud
-        # ("2 running" in the UI, wasted VRAM). Progress is reported via
-        # websocket events in _execute_job instead; the item is registered
-        # into currently_running there so history still works.
+        # Visible in the native queue (pending counts, /queue, delete/clear
+        # actions all work), but _install_modal_queue_guard() stops the
+        # LOCAL worker from consuming Modal-owned items — no double run.
+        _MODAL_PROMPT_IDS.add(prompt_id)
         pq = _pq()
         if pq:
-            pq.server.queue_updated()
+            pq.put(item)
 
         await _queue.put((item, item_id))
 
