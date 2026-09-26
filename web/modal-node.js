@@ -15,6 +15,20 @@ app.registerExtension({
   async setup() {
     log("Extension loaded. Patching fetchApi...");
 
+    // Init the cloud/local flag here (not only when the sidebar panel
+    // renders): the panel builds lazily when the tab is first opened, but
+    // /prompt interception can happen before that. Without this, the flag
+    // is `undefined` at startup and `!== false` misroutes saved-Local
+    // mode to the cloud endpoint until the user toggles once.
+    try {
+      const saved = localStorage.getItem("comfymodal_enabled");
+      if (window._comfyModalEnabled === undefined) {
+        window._comfyModalEnabled = saved === null ? true : saved === "true";
+      }
+    } catch {
+      if (window._comfyModalEnabled === undefined) window._comfyModalEnabled = true;
+    }
+
     _originalFetchApi = api.fetchApi.bind(api);
     api.fetchApi = async function (route, options = {}) {
       const isPromptPost =

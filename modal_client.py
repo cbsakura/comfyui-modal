@@ -107,16 +107,39 @@ async def delete_model(folder: str, filename: str) -> dict:
 
 @_modal_error_handler
 async def sync_custom_nodes(archive_data: bytes) -> dict:
-    return await asyncio.to_thread(
-        lambda: _sync_custom_nodes_fn.remote(archive_data),
-    )
+    size_mb = len(archive_data) / 1024**2
+    print(f"[comfyui-modal] Calling Modal sync_custom_nodes_to_volume ({size_mb:.1f} MB)... "
+          f"first call may build the image (several minutes).")
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: _sync_custom_nodes_fn.remote(archive_data),
+            ),
+            timeout=600,
+        )
+    except TimeoutError:
+        raise TimeoutError(
+            "Sync timed out after 10 min. The Modal image may still be building — "
+            "wait a few minutes and retry. Check `modal app logs comfyui` for progress."
+        ) from None
+    print(f"[comfyui-modal] Modal sync returned: {result.get('status') if isinstance(result, dict) else result}")
+    return result
 
 
 @_modal_error_handler
 async def get_sync_status() -> dict:
-    return await asyncio.to_thread(
-        lambda: _get_volume_status_fn.remote(),
-    )
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: _get_volume_status_fn.remote(),
+            ),
+            timeout=180,
+        )
+    except TimeoutError:
+        raise TimeoutError(
+            "Volume status timed out after 3 min. The Modal image may still be building "
+            "(first call takes several minutes) — wait and retry."
+        ) from None
 
 
 @_modal_error_handler

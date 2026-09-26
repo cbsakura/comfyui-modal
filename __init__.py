@@ -473,12 +473,15 @@ if _server:
             extra_data = {"client_id": client_id, "create_time": int(time.time() * 1000)}
             item = (_item_counter, prompt_id, workflow, extra_data, list(workflow.keys()), {})
 
+        # NOTE: Do NOT push this item into the local ComfyUI prompt queue
+        # (pq.queue). The local execution loop consumes pq.queue, so pushing
+        # here runs the SAME workflow locally in addition to Modal cloud
+        # ("2 running" in the UI, wasted VRAM). Progress is reported via
+        # websocket events in _execute_job instead; the item is registered
+        # into currently_running there so history still works.
         pq = _pq()
         if pq:
-            with pq.mutex:
-                import heapq
-                heapq.heappush(pq.queue, item)
-                pq.server.queue_updated()
+            pq.server.queue_updated()
 
         await _queue.put((item, item_id))
 
@@ -629,7 +632,14 @@ if _server:
         """Get sync status: compare local models/custom_nodes with remote volumes."""
         try:
             # Get remote volume status
-            remote = await get_sync_status()
+            # (first Modal call builds the image — allow extra time, don't hang forever)
+            try:
+                remote = await asyncio.wait_for(get_sync_status(), timeout=200)
+            except (asyncio.TimeoutError, TimeoutError) as e:
+                msg = str(e) or ("Modal is still building the image (first call takes several minutes). "
+                                 "Wait a few minutes and press Refresh again.")
+                print(f"[comfyui-modal] sync/status timed out: {msg}")
+                return web.json_response({"status": "error", "message": msg}, status=504)
         except Exception as e:
             return web.json_response({"status": "error", "message": str(e)}, status=503)
 
@@ -774,7 +784,11 @@ if _server:
             return tarinfo
 
         # Create tar.gz archive
+        # NOTE: skip this node itself (comfyui-modal) — shipping it to the
+        # cloud would overwrite/symlink the running extension and bloat upload.
+        _SELF_DIR = os.path.basename(_NODE_DIR)
         buf = io.BytesIO()
+        packed = []
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             for node_dir in os.listdir(cn_root):
                 node_path = os.path.join(cn_root, node_dir)
@@ -782,14 +796,26 @@ if _server:
                     continue
                 if node_dir.startswith(".") or node_dir == "__pycache__":
                     continue
+                if node_dir == _SELF_DIR:
+                    continue
                 tar.add(node_path, arcname=node_dir, filter=tar_filter)
+                packed.append(node_dir)
 
         archive_data = buf.getvalue()
+        print(f"[comfyui-modal] Syncing {len(packed)} custom nodes "
+              f"({len(archive_data) / 1024**2:.1f} MB): {sorted(packed)}")
 
         try:
+            print(f"[comfyui-modal] Uploading archive to Modal (first run builds the image, may take minutes)...")
             result = await sync_custom_nodes(archive_data)
+            print(f"[comfyui-modal] Sync done: {result}")
             return web.json_response(result)
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            msg = str(e)
+            print(f"[comfyui-modal] Sync timed out: {msg}")
+            return web.json_response({"status": "error", "message": msg}, status=504)
         except Exception as e:
+            print(f"[comfyui-modal] Sync failed: {e}")
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
     print("[comfyui-modal] Routes registered: /comfymodal/prompt, /comfymodal/model/install, /comfymodal/models/batch-install, /comfymodal/health, /comfymodal/object_info, /comfymodal/cancel/{id}, /comfymodal/models, /comfymodal/sync/status, /comfymodal/sync/models, /comfymodal/sync/custom-nodes")

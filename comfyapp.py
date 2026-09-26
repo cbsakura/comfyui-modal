@@ -10,12 +10,20 @@ _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NODE_DIR not in sys.path:
     sys.path.insert(0, _NODE_DIR)
 
-from workflow_inputs import stage_remote_input_images
+try:
+    from workflow_inputs import stage_remote_input_images
+except ImportError:
+    # Volume-helper functions (sync/status/upload) run on the slim image,
+    # which intentionally has no local sources. They never call this helper
+    # (only run_prompt does, and it runs on the main image which has it).
+    # A hard top-level import would crash-loop those functions at import.
+    def stage_remote_input_images(*args, **kwargs):
+        raise RuntimeError("workflow_inputs module not available in this image")
 
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.0.2"
+COMFYAPP_VERSION = "2.0.7"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -27,17 +35,37 @@ CUSTOM_NODES_PATH = "/root/custom_nodes_vol"
 
 SUPPORTED_GPUS = ["a10g", "a100", "t4"]
 
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install(
-        "git",
-        "libgl1",
-        "libglib2.0-0",
-        "libsm6",
-        "libxrender1",
-        "libxext6",
-        "ffmpeg",
+# NOTE: Do not use `.apt_install()` in separate layers on the legacy image
+# builder: its default `debian_slim` base is bullseye, whose
+# bullseye-security APT pool now returns 404 for many packages
+# (openssh-client, libasound2, ffmpeg, mesa, ...).
+# Pin bookworm explicitly and run `apt-get update + install` in a single
+# RUN layer so the package index can never go stale.
+APT_PACKAGES = "git libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 ffmpeg"
+
+
+def _base_image():
+    """Bookworm-based Python image, working on both legacy and new builders."""
+    try:
+        from_registry = getattr(modal.Image, "from_registry", None)
+        if callable(from_registry):
+            return from_registry("python:3.11-slim-bookworm")
+    except Exception:
+        pass
+    return modal.Image.debian_slim(python_version="3.11")
+
+
+def _apt_install_cmd():
+    return (
+        "apt-get update && "
+        f"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {APT_PACKAGES} "
+        "&& rm -rf /var/lib/apt/lists/*"
     )
+
+
+image = (
+    _base_image()
+    .run_commands(_apt_install_cmd())
     .pip_install("comfy-cli==1.3.7")
     .run_commands(
         "comfy --skip-prompt install --nvidia",
@@ -46,8 +74,14 @@ image = (
     .add_local_python_source("workflow_inputs")
 )
 
+# Shared slim base for all lightweight volume functions.
+# IMPORTANT: use ONE object so Modal builds/caches ONE image.
+# (Calling _base_image() per-function creates distinct images and forces
+# a separate remote build on first call of each function.)
+_slim_image = _base_image()
+
 download_image = (
-    modal.Image.debian_slim(python_version="3.11")
+    _slim_image
     .pip_install("httpx>=0.27.0")
     .add_local_python_source("workflow_inputs")
 )
@@ -129,7 +163,7 @@ def batch_download_models(items: list, hf_token: str = "") -> list:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=_slim_image,
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -188,11 +222,12 @@ def sync_custom_nodes_to_volume(archive_data: bytes) -> dict:
 
     # List what was extracted
     nodes = [d for d in os.listdir(CUSTOM_NODES_PATH) if os.path.isdir(os.path.join(CUSTOM_NODES_PATH, d))]
-    return {"status": "ok", "nodes": nodes}
+    print(f"[comfyui-modal] Synced {len(nodes)} custom nodes ({len(archive_data) / 1024**2:.1f} MB): {sorted(nodes)}")
+    return {"status": "ok", "nodes": sorted(nodes)}
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=_slim_image,
     cpu=1,
     memory=512,
     timeout=60,
@@ -228,7 +263,7 @@ def get_volume_status() -> dict:
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=_slim_image,
     cpu=2,
     memory=4096,
     timeout=1800,
@@ -250,7 +285,7 @@ def upload_model_to_volume(file_data: bytes, folder: str, filename: str) -> dict
 
 
 @app.function(
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=_slim_image,
     cpu=2,
     memory=4096,
     timeout=3600,
@@ -289,37 +324,78 @@ class _ComfyAPIMixin:
             shutil.rmtree(comfy_models)
         os.symlink(MODELS_PATH, comfy_models)
 
-        # Sync custom nodes from volume into ComfyUI
+        self._link_custom_nodes_from_volume()
+        self._start_comfy()
+
+    @modal.enter(snap=False)
+    def restore(self):
+        # A sync may have added new custom nodes to the volume AFTER this
+        # container was snapshotted. Link anything new and restart ComfyUI
+        # so the new node types are actually loaded (ComfyUI only scans
+        # custom_nodes at process start).
+        try:
+            new_nodes = self._link_custom_nodes_from_volume()
+        except Exception as e:
+            print(f"[comfyui-modal] WARNING: custom-node relink failed: {e}")
+            new_nodes = []
+        if new_nodes:
+            print(f"[comfyui-modal] New custom nodes detected ({new_nodes}), restarting ComfyUI...")
+            self._restart_comfy()
+        else:
+            self._wait_for_comfy()
+
+    def _link_custom_nodes_from_volume(self) -> list:
+        """Symlink volume custom nodes into ComfyUI. Returns newly linked dirs."""
+        import os
+
         vol.reload()
         custom_nodes_vol.reload()
         comfy_custom_nodes = "/root/comfy/ComfyUI/custom_nodes"
         vol_cn_path = CUSTOM_NODES_PATH
+        newly_linked = []
         if os.path.isdir(vol_cn_path):
-            for node_dir in os.listdir(vol_cn_path):
+            for node_dir in sorted(os.listdir(vol_cn_path)):
                 src = os.path.join(vol_cn_path, node_dir)
                 dst = os.path.join(comfy_custom_nodes, node_dir)
                 if os.path.isdir(src) and not os.path.exists(dst):
                     os.symlink(src, dst)
+                    newly_linked.append(node_dir)
                     # Install requirements if present
                     req_file = os.path.join(src, "requirements.txt")
                     if os.path.isfile(req_file):
                         try:
-                            subprocess.run(
+                            print(f"[comfyui-modal] Installing requirements for {node_dir}...")
+                            result = subprocess.run(
                                 [sys.executable, "-m", "pip", "install", "-r", req_file],
-                                capture_output=True, timeout=600
+                                capture_output=True, text=True, timeout=600,
                             )
+                            if result.returncode != 0:
+                                print(
+                                    f"[comfyui-modal] WARNING: requirements failed for {node_dir}: "
+                                    f"{(result.stderr or result.stdout)[-2000:]}"
+                                )
                         except Exception as e:
                             print(f"[comfyui-modal] WARNING: Failed to install requirements for {node_dir}: {e}")
+        if newly_linked:
+            print(f"[comfyui-modal] Linked custom nodes: {newly_linked}")
+        return newly_linked
 
+    def _start_comfy(self):
         self._proc = subprocess.Popen(
             ["comfy", "launch", "--", "--listen", "0.0.0.0",
              f"--port={COMFYUI_API_PORT}", "--disable-auto-launch"],
         )
         self._wait_for_comfy()
 
-    @modal.enter(snap=False)
-    def restore(self):
-        self._wait_for_comfy()
+    def _restart_comfy(self):
+        proc = getattr(self, "_proc", None)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self._start_comfy()
 
     @modal.exit()
     def shutdown(self):
@@ -379,12 +455,23 @@ class _ComfyAPIMixin:
                 node_errors = error_data.get("node_errors", {})
                 if node_errors:
                     msgs = []
+                    missing_types = []
                     for node_id, err_info in node_errors.items():
                         class_type = err_info.get("class_type", f"Node {node_id}")
                         for err in err_info.get("errors", []):
                             msgs.append(f"{class_type}: {err.get('message', 'unknown error')}")
+                            if err.get("type") == "missing_node_type":
+                                missing_types.append(class_type)
                     if msgs:
-                        raise RuntimeError(f"Workflow validation failed: {'; '.join(msgs)}") from e
+                        detail = '; '.join(msgs)
+                        if missing_types:
+                            detail += (
+                                " | Missing custom node(s) on Modal cloud: "
+                                + ", ".join(sorted(set(missing_types)))
+                                + ". Run 'Sync Custom Nodes' in the Modal panel, "
+                                + "wait ~60s for a cold start, then retry."
+                            )
+                        raise RuntimeError(f"Workflow validation failed: {detail}") from e
                 # Fallback: use the message field
                 msg = error_data.get("message", "") or error_data.get("error", "")
                 if msg:
@@ -500,6 +587,11 @@ class _ComfyAPIMixin:
         return {"status": "ok", "deleted": f"{safe_folder}/{safe_file}"}
 
 
+# NOTE: max_inputs=1 on purpose. Video generations nearly fill GPU VRAM,
+# so sharing one snapshotted container between concurrent inputs risks OOM.
+# Worse, cancelling one input shuts down the whole container and kills the
+# other in-flight inputs (Modal reschedules them, causing error cascades).
+# Extra prompts scale out to separate containers instead.
 @app.cls(
     gpu="a10g",
     cpu=4,
@@ -512,7 +604,7 @@ class _ComfyAPIMixin:
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
-@modal.concurrent(max_inputs=4)
+@modal.concurrent(max_inputs=1)
 class ComfyAPI(_ComfyAPIMixin):
     pass
 
@@ -529,7 +621,7 @@ class ComfyAPI(_ComfyAPIMixin):
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
-@modal.concurrent(max_inputs=4)
+@modal.concurrent(max_inputs=1)
 class ComfyAPI_A100(_ComfyAPIMixin):
     pass
 
@@ -546,6 +638,6 @@ class ComfyAPI_A100(_ComfyAPIMixin):
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
 )
-@modal.concurrent(max_inputs=4)
+@modal.concurrent(max_inputs=1)
 class ComfyAPI_T4(_ComfyAPIMixin):
     pass

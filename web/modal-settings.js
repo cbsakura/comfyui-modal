@@ -988,9 +988,15 @@ function buildPanel() {
     syncCNBtn.disabled = true;
     syncCNBtn.textContent = "Syncing Custom Nodes...";
     syncCNStatus.style.color = "#f5a623";
-    syncCNStatus.textContent = "Packaging and uploading custom nodes...";
+    syncCNStatus.textContent = "Packaging and uploading custom nodes (large folders can take several minutes)...";
+    // Abort after 10 min so the button never stays stuck on "Syncing..."
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), 10 * 60 * 1000) : null;
     try {
-      const resp = await api.fetchApi(`${MODAL_PREFIX}/sync/custom-nodes`, { method: "POST" });
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/sync/custom-nodes`, {
+        method: "POST",
+        ...(ctrl ? { signal: ctrl.signal } : {}),
+      });
       const data = await resp.json();
       if (data.status === "ok") {
         const count = (data.nodes || []).length;
@@ -1003,8 +1009,12 @@ function buildPanel() {
       }
     } catch (e) {
       syncCNStatus.style.color = "#e05050";
-      syncCNStatus.textContent = "Error: " + e.message;
+      syncCNStatus.textContent = "Error: " + (e && e.name === "AbortError"
+        ? "timed out after 10 min (archive may be too large)"
+        : e.message);
       showToast("Sync failed: " + e.message, "error");
+    } finally {
+      if (timer) clearTimeout(timer);
     }
     syncCNBtn.disabled = false;
     syncCNBtn.textContent = "\u2B06 Sync Custom Nodes";
@@ -1013,11 +1023,20 @@ function buildPanel() {
   async function loadSyncStatus() {
     if (!syncStatusEl) return;
     syncStatusEl.style.color = "#aaa";
-    syncStatusEl.textContent = "Loading...";
+    syncStatusEl.textContent = "Loading... (first check may take minutes while Modal builds the image)";
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), 220 * 1000) : null;
     try {
-      const resp = await api.fetchApi(`${MODAL_PREFIX}/sync/status`);
-      if (resp.status === 503) {
-        syncStatusEl.innerHTML = '<span style="color:#888;">Deploy the app first to check sync status.</span>';
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/sync/status`, {
+        ...(ctrl ? { signal: ctrl.signal } : {}),
+      });
+      if (resp.status === 503 || resp.status === 504) {
+        const data = await resp.json().catch(() => ({}));
+        syncStatusEl.style.color = "#f5a623";
+        syncStatusEl.textContent = data.message
+          || (resp.status === 504
+            ? "Modal is still building the image. Wait a few minutes and press Refresh again."
+            : "Deploy the app first to check sync status.");
         syncCollapsible.refreshHeight();
         return;
       }
@@ -1048,8 +1067,12 @@ function buildPanel() {
       syncCollapsible.refreshHeight();
     } catch (e) {
       syncStatusEl.style.color = "#e05050";
-      syncStatusEl.textContent = "Error: " + e.message;
+      syncStatusEl.textContent = "Error: " + (e && e.name === "AbortError"
+        ? "timed out — Modal image may still be building. Wait and retry."
+        : e.message);
       syncCollapsible.refreshHeight();
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
