@@ -249,6 +249,10 @@ except ImportError:
 
 _COMFYUI_ROOT = os.path.dirname(os.path.dirname(_NODE_DIR))
 
+# Must match comfyapp.py (kept as literals to avoid importing modal app here).
+_MODAL_MODELS_VOLUME = "comfyui-models"
+_MODAL_CN_VOLUME = "comfyui-custom-nodes"
+
 _MODAL_TOML_PATH = os.path.expanduser("~/.modal.toml")
 _HF_TOKEN_PATH = os.path.join(os.path.dirname(__file__), ".hf_token")
 
@@ -762,34 +766,73 @@ if _server:
 
     @_server.routes.post("/comfymodal/sync/models")
     async def modal_sync_models(request: web.Request) -> web.Response:
-        """Upload local models that are not yet on the remote volume."""
+        """Upload local models that are not yet on the remote volume.
+
+        Body may contain {"items": [{"folder": ..., "name": ...}]} to upload
+        only the selected models. Without it, all pending models are uploaded.
+        """
         CHUNK_SIZE = 100 * 1024 * 1024  # 100MB chunks
 
-        try:
-            remote = await get_sync_status()
-        except Exception as e:
-            return web.json_response({"status": "error", "message": str(e)}, status=503)
-
-        remote_model_keys = {f"{m['folder']}/{m['name']}" for m in remote.get("models", [])}
-
-        # Scan local models
         models_root = os.path.join(_COMFYUI_ROOT, "models")
+
+        def _resolve(folder: str, name: str):
+            safe_folder = os.path.basename(folder or "")
+            safe_name = os.path.basename(name or "")
+            if not safe_folder or not safe_name:
+                return None
+            fpath = os.path.join(models_root, safe_folder, safe_name)
+            if not os.path.isfile(fpath) or os.path.getsize(fpath) == 0:
+                return None
+            return {"folder": safe_folder, "name": safe_name,
+                    "path": fpath, "size": os.path.getsize(fpath)}
+
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        requested = body.get("items")
+
         to_upload = []
-        if os.path.isdir(models_root):
-            for folder in os.listdir(models_root):
-                folder_path = os.path.join(models_root, folder)
-                if not os.path.isdir(folder_path):
+        if isinstance(requested, list) and requested:
+            missing = []
+            for it in requested:
+                if not isinstance(it, dict):
                     continue
-                for fname in os.listdir(folder_path):
-                    fpath = os.path.join(folder_path, fname)
-                    if not os.path.isfile(fpath) or fname.startswith("."):
+                resolved = _resolve(it.get("folder", ""), it.get("filename", it.get("name", "")))
+                if resolved:
+                    to_upload.append(resolved)
+                else:
+                    missing.append(f"{it.get('folder', '')}/{it.get('filename', it.get('name', ''))}")
+            if not to_upload:
+                return web.json_response(
+                    {"status": "error",
+                     "message": f"Selected files not found locally: {', '.join(missing)}"},
+                    status=400)
+        else:
+            try:
+                remote = await get_sync_status()
+            except Exception as e:
+                return web.json_response({"status": "error", "message": str(e)}, status=503)
+
+            remote_model_keys = {f"{m['folder']}/{m['name']}" for m in remote.get("models", [])}
+
+            # Scan local models
+            if os.path.isdir(models_root):
+                for folder in os.listdir(models_root):
+                    folder_path = os.path.join(models_root, folder)
+                    if not os.path.isdir(folder_path):
                         continue
-                    size = os.path.getsize(fpath)
-                    if size == 0:
-                        continue
-                    key = f"{folder}/{fname}"
-                    if key not in remote_model_keys:
-                        to_upload.append({"folder": folder, "name": fname, "path": fpath, "size": size})
+                    for fname in os.listdir(folder_path):
+                        fpath = os.path.join(folder_path, fname)
+                        if not os.path.isfile(fpath) or fname.startswith("."):
+                            continue
+                        size = os.path.getsize(fpath)
+                        if size == 0:
+                            continue
+                        key = f"{folder}/{fname}"
+                        if key not in remote_model_keys:
+                            to_upload.append({"folder": folder, "name": fname, "path": fpath, "size": size})
 
         if not to_upload:
             return web.json_response({"status": "ok", "message": "All models already synced", "uploaded": 0})
@@ -822,6 +865,124 @@ if _server:
         if errors:
             result["errors"] = errors
         return web.json_response(result)
+
+    @_server.routes.post("/comfymodal/sync/cli")
+    async def modal_sync_cli(request: web.Request) -> web.Response:
+        """Generate a Windows .bat script using `modal volume put` commands.
+
+        Body: {"models": [{"folder": ..., "name": ...}], "custom_nodes": ["dirname", ...]}.
+        Omitted/empty lists fall back to the currently pending items
+        (requires a Modal round-trip for the remote status).
+        Runs nothing — just returns the script text for manual execution.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        models_root = os.path.join(_COMFYUI_ROOT, "models")
+        cn_root = os.path.join(_COMFYUI_ROOT, "custom_nodes")
+        _SELF_DIR = os.path.basename(_NODE_DIR)
+
+        def _bad(s: str) -> bool:
+            return not s or '"' in s or "\n" in s or "\r" in s
+
+        req_models = body.get("models")
+        req_nodes = body.get("custom_nodes")
+        models_given = isinstance(req_models, list)
+        nodes_given = isinstance(req_nodes, list)
+
+        model_items = []
+        node_dirs = []
+        if models_given and req_models:
+            for it in req_models:
+                if not isinstance(it, dict):
+                    continue
+                folder = os.path.basename(it.get("folder", ""))
+                name = os.path.basename(it.get("filename", it.get("name", "")))
+                if _bad(folder) or _bad(name):
+                    continue
+                fpath = os.path.join(models_root, folder, name)
+                if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+                    model_items.append({"folder": folder, "name": name, "path": fpath})
+            if not model_items:
+                return web.json_response(
+                    {"status": "error", "message": "Selected model files not found locally."},
+                    status=400)
+        if nodes_given and req_nodes:
+            for d in req_nodes:
+                if not isinstance(d, str):
+                    continue
+                dirname = os.path.basename(d)
+                if _bad(dirname) or dirname == _SELF_DIR or dirname.startswith("."):
+                    continue
+                if os.path.isdir(os.path.join(cn_root, dirname)):
+                    node_dirs.append(dirname)
+            if not node_dirs:
+                return web.json_response(
+                    {"status": "error", "message": "Selected custom nodes not found locally."},
+                    status=400)
+
+        if not models_given or not nodes_given:
+            # Fall back to pending items for whichever side wasn't specified.
+            # (An explicitly empty list means "none", not "all".)
+            try:
+                remote = await asyncio.wait_for(get_sync_status(), timeout=200)
+            except (asyncio.TimeoutError, TimeoutError) as e:
+                msg = str(e) or ("Modal is still building the image. "
+                                 "Wait a few minutes and retry.")
+                return web.json_response({"status": "error", "message": msg}, status=504)
+            except Exception as e:
+                return web.json_response({"status": "error", "message": str(e)}, status=503)
+            if not models_given:
+                remote_keys = {f"{m['folder']}/{m['name']}" for m in remote.get("models", [])}
+                if os.path.isdir(models_root):
+                    for folder in sorted(os.listdir(models_root)):
+                        fdir = os.path.join(models_root, folder)
+                        if not os.path.isdir(fdir):
+                            continue
+                        for fname in sorted(os.listdir(fdir)):
+                            fpath = os.path.join(fdir, fname)
+                            if not os.path.isfile(fpath) or fname.startswith("."):
+                                continue
+                            if os.path.getsize(fpath) == 0:
+                                continue
+                            if f"{folder}/{fname}" not in remote_keys:
+                                model_items.append({"folder": folder, "name": fname, "path": fpath})
+            if not nodes_given:
+                remote_cn = set(remote.get("custom_nodes", []))
+                if os.path.isdir(cn_root):
+                    for d in sorted(os.listdir(cn_root)):
+                        if not os.path.isdir(os.path.join(cn_root, d)):
+                            continue
+                        if d.startswith(".") or d == "__pycache__" or d == _SELF_DIR:
+                            continue
+                        if d not in remote_cn:
+                            node_dirs.append(d)
+
+        if not model_items and not node_dirs:
+            return web.json_response({"status": "ok", "bat": "REM Everything already synced - nothing to do.\r\n",
+                                      "models": 0, "custom_nodes": 0})
+
+        lines = ["@echo off",
+                 "REM Generated by comfyui-modal : Modal volume sync script",
+                 "REM Requires: pip install modal  +  modal setup",
+                 "chcp 65001 >nul",
+                 ""]
+        for it in model_items:
+            lines.append(f"modal volume put \"{_MODAL_MODELS_VOLUME}\" \"{it['path']}\" \"/{it['folder']}/\"")
+        for d in node_dirs:
+            lines.append(f"modal volume put \"{_MODAL_CN_VOLUME}\" \"{os.path.join(cn_root, d)}\" \"/{d}\"")
+        lines.append("")
+        lines.append(f"REM Done: {len(model_items)} model(s), {len(node_dirs)} custom node(s).")
+        bat = "\r\n".join(lines)
+        print(f"[comfyui-modal] Generated CLI sync script: "
+              f"{len(model_items)} models, {len(node_dirs)} custom nodes.")
+        return web.json_response({"status": "ok", "bat": bat,
+                                  "models": len(model_items),
+                                  "custom_nodes": len(node_dirs)})
 
     @_server.routes.post("/comfymodal/sync/custom-nodes")
     async def modal_sync_custom_nodes(request: web.Request) -> web.Response:

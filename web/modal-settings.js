@@ -58,6 +58,8 @@ let _deployPollTimer = null;
 let _deployState = "idle";
 let _hasChanges = false;
 let _deployWarning = "";
+let _lastPendingModels = [];
+let _lastPendingCN = [];
 
 const STATUS_STYLE = {
   [STATUS.UNKNOWN]:    { color: "#888",    label: "Unknown" },
@@ -933,16 +935,86 @@ function buildPanel() {
   syncRefreshBtn.onclick = () => loadSyncStatus();
   syncContent.appendChild(syncRefreshBtn);
 
-  // Sync Models button
+  // Sync Models button (all pending)
   const syncModelsBtn = document.createElement("button");
-  syncModelsBtn.textContent = "\u2B06 Sync Models";
-  syncModelsBtn.title = "Upload local models that are not yet on Modal";
+  syncModelsBtn.textContent = "\u2B06 Sync All Models";
+  syncModelsBtn.title = "Upload all local models that are not yet on Modal (slow for large files — see CLI option below)";
   syncModelsBtn.style.cssText = btnStyle("primary") + "margin-bottom: 4px;";
   syncContent.appendChild(syncModelsBtn);
 
   const syncModelsStatus = document.createElement("div");
   syncModelsStatus.style.cssText = "font-size: 11px; color: #888; min-height: 14px; margin-bottom: 10px;";
   syncContent.appendChild(syncModelsStatus);
+
+  // Pending-model selector (checkboxes)
+  const pendingLabel = document.createElement("div");
+  pendingLabel.style.cssText = "font-size: 11px; font-weight: 600; color: #aaa; margin-bottom: 4px;";
+  pendingLabel.textContent = "Pending models (check to select):";
+  syncContent.appendChild(pendingLabel);
+
+  const pendingListEl = document.createElement("div");
+  pendingListEl.style.cssText = "max-height: 130px; overflow-y: auto; background: #2a2a2a; border-radius: 4px; padding: 6px; margin-bottom: 6px; font-size: 12px;";
+  pendingListEl.textContent = "—";
+  syncContent.appendChild(pendingListEl);
+
+  const selectedRow = document.createElement("div");
+  selectedRow.style.cssText = "display: flex; gap: 6px; margin-bottom: 10px;";
+
+  const syncSelectedBtn = document.createElement("button");
+  syncSelectedBtn.textContent = "\u2B06 Sync Selected";
+  syncSelectedBtn.title = "Upload only the checked models via ComfyUI";
+  syncSelectedBtn.style.cssText = btnStyle() + "flex: 1;";
+  selectedRow.appendChild(syncSelectedBtn);
+
+  const cliBtn = document.createElement("button");
+  cliBtn.textContent = "\u2328 CLI (.bat)";
+  cliBtn.title = "Generate modal CLI commands for the checked models (fast: runs outside ComfyUI)";
+  cliBtn.style.cssText = btnStyle() + "flex: 1;";
+  selectedRow.appendChild(cliBtn);
+  syncContent.appendChild(selectedRow);
+
+  const selectedStatus = document.createElement("div");
+  selectedStatus.style.cssText = "font-size: 11px; color: #888; min-height: 14px; margin-bottom: 10px;";
+  syncContent.appendChild(selectedStatus);
+
+  function getCheckedModels() {
+    const out = [];
+    pendingListEl.querySelectorAll("input[data-folder][data-name]:checked").forEach((cb) => {
+      out.push({ folder: cb.dataset.folder, name: cb.dataset.name });
+    });
+    return out;
+  }
+
+  function renderPendingList(pending) {
+    pendingListEl.innerHTML = "";
+    if (!pending || pending.length === 0) {
+      pendingListEl.style.color = "#7ed321";
+      pendingListEl.textContent = "\u2713 All models synced.";
+      return;
+    }
+    pendingListEl.style.color = "#ddd";
+    for (const m of pending) {
+      const label = document.createElement("label");
+      label.style.cssText = "display: flex; align-items: center; gap: 6px; padding: 2px 0; cursor: pointer;";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = true;
+      cb.dataset.folder = m.folder;
+      cb.dataset.name = m.name;
+      const span = document.createElement("span");
+      span.style.cssText = "flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
+      span.title = `${m.folder}/${m.name}`;
+      span.textContent = `${m.folder}/${m.name}`;
+      const size = document.createElement("span");
+      size.style.cssText = "color: #666; font-size: 11px; flex-shrink: 0;";
+      size.textContent = fmtSize(m.size);
+      label.appendChild(cb);
+      label.appendChild(span);
+      label.appendChild(size);
+      pendingListEl.appendChild(label);
+    }
+    syncCollapsible.refreshHeight();
+  }
 
   // Sync Custom Nodes button
   const syncCNBtn = document.createElement("button");
@@ -981,8 +1053,187 @@ function buildPanel() {
       showToast("Sync failed: " + e.message, "error");
     }
     syncModelsBtn.disabled = false;
-    syncModelsBtn.textContent = "\u2B06 Sync Models";
+    syncModelsBtn.textContent = "\u2B06 Sync All Models";
   };
+
+  async function syncModelsRequest(items, statusEl, btn, btnLabel) {
+    btn.disabled = true;
+    const prev = btn.textContent;
+    btn.textContent = "Syncing...";
+    statusEl.style.color = "#f5a623";
+    statusEl.textContent = items && items.length
+      ? `Uploading ${items.length} selected model(s)...`
+      : "Uploading models to Modal volume...";
+    try {
+      const resp = await api.fetchApi(`${MODAL_PREFIX}/sync/models`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(items && items.length ? { items } : {}),
+      });
+      const data = await resp.json();
+      if (data.status === "ok") {
+        statusEl.style.color = "#7ed321";
+        statusEl.textContent = data.uploaded > 0
+          ? `Done! ${data.uploaded}/${data.total} model(s) uploaded.`
+          : data.message || "All models already synced.";
+        showToast(data.uploaded > 0 ? `${data.uploaded} model(s) synced!` : "Models already synced", "success");
+        await loadSyncStatus();
+        await loadModels();
+      } else {
+        throw new Error(data.message || "Sync failed");
+      }
+      if (data.errors && data.errors.length) {
+        statusEl.textContent += ` (${data.errors.length} failed)`;
+      }
+    } catch (e) {
+      statusEl.style.color = "#e05050";
+      statusEl.textContent = "Error: " + e.message;
+      showToast("Sync failed: " + e.message, "error");
+    }
+    btn.disabled = false;
+    btn.textContent = btnLabel;
+  }
+
+  syncSelectedBtn.onclick = async () => {
+    const checked = getCheckedModels();
+    if (checked.length === 0) {
+      selectedStatus.style.color = "#e05050";
+      selectedStatus.textContent = "No models checked.";
+      return;
+    }
+    selectedStatus.textContent = "";
+    await syncModelsRequest(checked, selectedStatus, syncSelectedBtn, "\u2B06 Sync Selected");
+  };
+
+  cliBtn.onclick = async () => {
+    const checked = getCheckedModels();
+    // No selection (or everything synced): fall back to all pending on server.
+    const models = checked.length ? checked : null;
+    await showCliOverlay(models);
+  };
+
+  async function fetchCliBat(models, includeNodes) {
+    const payload = {};
+    if (models) {
+      payload.models = models;
+      // Explicit empty array = "no nodes" (server only falls back for missing keys).
+      payload.custom_nodes = includeNodes ? _lastPendingCN : [];
+    } else if (includeNodes) {
+      payload.custom_nodes = _lastPendingCN;
+    }
+    const resp = await api.fetchApi(`${MODAL_PREFIX}/sync/cli`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (data.status !== "ok") throw new Error(data.message || "Failed to generate script");
+    return data;
+  }
+
+  async function showCliOverlay(models) {
+    const prev = document.getElementById("cli-bat-overlay");
+    if (prev) prev.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "cli-bat-overlay";
+    overlay.style.cssText = `
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.7); z-index: 99999;
+      display: flex; align-items: center; justify-content: center;
+    `;
+    const box = document.createElement("div");
+    box.style.cssText = `
+      background: #1e1e2e; border: 1px solid #444; border-radius: 8px;
+      width: 80%; max-width: 800px; max-height: 80vh;
+      display: flex; flex-direction: column; overflow: hidden;
+    `;
+    const header = document.createElement("div");
+    header.style.cssText = "display: flex; align-items: center; padding: 12px 16px; border-bottom: 1px solid #333;";
+    const title = document.createElement("span");
+    title.style.cssText = "font-weight: 600; font-size: 14px; color: #ddd; flex: 1;";
+    title.textContent = "Sync via modal CLI (.bat)";
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "\u2715";
+    closeBtn.style.cssText = "background: transparent; border: 1px solid #555; color: #aaa; width: 28px; height: 28px; border-radius: 4px; cursor: pointer;";
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+
+    const body = document.createElement("div");
+    body.style.cssText = "flex: 1; overflow-y: auto; padding: 16px; min-height: 0; display: flex; flex-direction: column; gap: 10px;";
+    const hint = document.createElement("div");
+    hint.style.cssText = "font-size: 11px; color: #888; line-height: 1.5;";
+    hint.textContent = "Save as .bat and run it yourself (much faster than syncing through ComfyUI). Requires: pip install modal + modal setup.";
+    const nodeRow = document.createElement("label");
+    nodeRow.style.cssText = "font-size: 12px; color: #ddd; display: flex; align-items: center; gap: 6px; cursor: pointer;";
+    const nodeCb = document.createElement("input");
+    nodeCb.type = "checkbox";
+    nodeCb.checked = false;
+    const nodeSpan = document.createElement("span");
+    nodeSpan.textContent = _lastPendingCN.length
+      ? `Also include ${_lastPendingCN.length} pending custom node(s)`
+      : "No pending custom nodes";
+    nodeCb.disabled = _lastPendingCN.length === 0;
+    nodeRow.appendChild(nodeCb);
+    nodeRow.appendChild(nodeSpan);
+    const pre = document.createElement("pre");
+    pre.style.cssText = "margin: 0; font-size: 11px; color: #ccc; white-space: pre-wrap; word-break: break-all; font-family: monospace; background: #111; padding: 10px; border-radius: 4px;";
+    pre.textContent = "Generating...";
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = "display: flex; gap: 6px;";
+    const copyBtn = document.createElement("button");
+    copyBtn.textContent = "Copy";
+    copyBtn.style.cssText = btnStyle() + "flex: 1; width: auto;";
+    const dlBtn = document.createElement("button");
+    dlBtn.textContent = "Download .bat";
+    dlBtn.style.cssText = btnStyle("primary") + "flex: 1; width: auto;";
+    btnRow.appendChild(copyBtn);
+    btnRow.appendChild(dlBtn);
+    body.appendChild(hint);
+    body.appendChild(nodeRow);
+    body.appendChild(pre);
+    body.appendChild(btnRow);
+    box.appendChild(header);
+    box.appendChild(body);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    let currentBat = "";
+    async function refresh() {
+      pre.textContent = "Generating...";
+      try {
+        const data = await fetchCliBat(models, nodeCb.checked);
+        currentBat = data.bat || "";
+        pre.textContent = currentBat || "(nothing to sync)";
+      } catch (e) {
+        pre.textContent = "Error: " + e.message;
+        pre.style.color = "#e05050";
+      }
+    }
+    nodeCb.onchange = refresh;
+    copyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(currentBat);
+        showToast("Copied to clipboard", "success");
+      } catch (e) {
+        showToast("Copy failed: " + e.message, "error");
+      }
+    };
+    dlBtn.onclick = () => {
+      const blob = new Blob([currentBat], { type: "text/plain;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "modal-sync.bat";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    };
+    function close() { overlay.remove(); document.removeEventListener("keydown", escHandler); }
+    const escHandler = (e) => { if (e.key === "Escape") close(); };
+    document.addEventListener("keydown", escHandler);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+    closeBtn.onclick = close;
+    await refresh();
+  }
 
   syncCNBtn.onclick = async () => {
     syncCNBtn.disabled = true;
@@ -1064,6 +1315,9 @@ function buildPanel() {
         </div>
       `;
       syncCollapsible.updateBadge(pendingModels + pendingCN > 0 ? `${pendingModels + pendingCN}` : "\u2713");
+      _lastPendingModels = ms.pending || [];
+      _lastPendingCN = cn.pending || [];
+      renderPendingList(_lastPendingModels);
       syncCollapsible.refreshHeight();
     } catch (e) {
       syncStatusEl.style.color = "#e05050";
