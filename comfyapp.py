@@ -23,7 +23,7 @@ except ImportError:
 # Bump this version whenever comfyapp.py changes.
 # The custom node compares this against the last deployed version
 # and re-runs `modal deploy` only when the version changes.
-COMFYAPP_VERSION = "2.0.7"
+COMFYAPP_VERSION = "2.0.9"
 
 APP_NAME = "comfyui"
 VOLUME_NAME = "comfyui-models"
@@ -41,7 +41,13 @@ SUPPORTED_GPUS = ["a10g", "a100", "t4"]
 # (openssh-client, libasound2, ffmpeg, mesa, ...).
 # Pin bookworm explicitly and run `apt-get update + install` in a single
 # RUN layer so the package index can never go stale.
-APT_PACKAGES = "git libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 ffmpeg"
+# NOTE: gcc is required at RUNTIME, not just build time: torch's Triton
+# kernels (e.g. bmm_outer_product used by newer text encoders like
+# MiniMax/Qwen3-VL) JIT-compile a small CUDA helper on first use, and
+# Triton aborts with "Failed to find C compiler" when cc is missing.
+# libc6-dev is needed alongside it: we install with --no-install-recommends,
+# which would otherwise skip the C standard headers (stdlib.h, ...).
+APT_PACKAGES = "git gcc libc6-dev libgl1 libglib2.0-0 libsm6 libxrender1 libxext6 ffmpeg"
 
 
 def _base_image():
